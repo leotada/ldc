@@ -24,6 +24,7 @@
 #endif
 
 #include "gen/passes/GarbageCollect2Stack.h"
+#include "gen/passes/GCCardMarking.h"
 #include "gen/passes/StripExternals.h"
 #include "gen/passes/SimplifyDRuntimeCalls.h"
 #include "gen/passes/WasmPointersSpill.h"
@@ -106,6 +107,11 @@ static cl::opt<bool> disableSimplifyDruntimeCalls(
 static cl::opt<bool> disableSimplifyLibCalls(
     "disable-simplify-libcalls", cl::ZeroOrMore,
     cl::desc("Disable simplification of well-known C runtime calls"));
+
+static cl::opt<bool> gcCardMarking(
+    "gc-card-marking", cl::ZeroOrMore, cl::Hidden, cl::init(false),
+    cl::desc("Mark the GC card of every pointer store to non-stack memory "
+             "(post-store barrier for a mostly-concurrent collector)"));
 
 static cl::opt<bool> disableGCToStack(
     "disable-gc2stack", cl::ZeroOrMore,
@@ -579,6 +585,9 @@ void runOptimizationPasses(llvm::Module *M, llvm::TargetMachine *TM) {
     mpm = pb.buildPerModuleDefaultPipeline(level);
   }
 
+  if (gcCardMarking) {
+    mpm.addPass(GCCardMarkingPass());
+  }
 
   mpm.run(*M,mam);
 }
@@ -653,6 +662,7 @@ void outputOptimizationSettings(llvm::raw_ostream &hash_os) {
   hash_os << disableSimplifyDruntimeCalls;
   hash_os << disableSimplifyLibCalls;
   hash_os << disableGCToStack;
+  hash_os << gcCardMarking;
   hash_os << stripDebug;
   hash_os << disableLoopUnrolling;
   hash_os << disableLoopVectorization;
