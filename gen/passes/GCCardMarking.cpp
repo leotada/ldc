@@ -20,13 +20,15 @@ using namespace llvm;
 
 namespace {
 
-constexpr unsigned CardShift = 9; // 512 byte cards
+constexpr unsigned CardShift = 9;     // 512 byte cards
+constexpr unsigned SummaryShift = 16; // 64 KiB summary
 
 struct Marker {
   Module &M;
   LLVMContext &C;
   Type *IntPtrTy;
   GlobalVariable *CardBase;
+  GlobalVariable *SummaryBase;
   FunctionCallee CardRange;
   InlineAsm *CompilerBarrier;
 
@@ -39,6 +41,12 @@ struct Marker {
       CardBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
                                     GlobalValue::ExternalLinkage, nullptr,
                                     "__sd_gc_card_base");
+    }
+    SummaryBase = M.getGlobalVariable("__sd_gc_card_summary_base");
+    if (!SummaryBase) {
+      SummaryBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+                                       GlobalValue::ExternalLinkage, nullptr,
+                                       "__sd_gc_card_summary_base");
     }
     CardRange = M.getOrInsertFunction(
         "__sd_gc_card_range", Type::getVoidTy(C), PtrTy, IntPtrTy);
@@ -67,6 +75,16 @@ struct Marker {
     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
+    markSummary(B, Int);
+  }
+
+  /// One byte per 64 KiB, so that finding the dirty cards of a big heap does
+  /// not mean reading all of the card table.
+  void markSummary(IRBuilder<> &B, Value *AddrInt) {
+    auto *SIdx = B.CreateLShr(AddrInt, ConstantInt::get(IntPtrTy, SummaryShift));
+    auto *SBase = B.CreateLoad(PointerType::getUnqual(C), SummaryBase);
+    auto *SSlot = B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx);
+    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), SSlot);
   }
 
   void markRange(IRBuilder<> &B, Value *Dst, Value *Size) {
@@ -96,6 +114,7 @@ struct Marker {
     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
+    markSummary(B, Int);
   }
 };
 
