@@ -12,10 +12,17 @@
 module core.internal.newaa;
 
 /// AA version for debuggers, bump whenever changing the layout
-immutable int _aaVersion = 1;
+immutable int _aaVersion = 2;
+
+/// present only in this modified version (the benchmark prints which one it has)
+immutable int _aaMarker = 1;
 
 import core.internal.util.math : min, max;
 import core.internal.traits : substInout;
+
+// The first buckets of an AA live inside the Impl block: a small AA is one
+// allocation for its table instead of two.
+private enum INLINE_BUCKETS = 8;
 
 // grow threshold
 private enum GROW_NUM = 4;
@@ -108,6 +115,22 @@ static struct Entry(K, V)
 {
     K key;
     V value;
+}
+
+// Whether the entries of an AA of K to V are handed out from chunks (see
+// Impl.takeFromChunk). Only for entries that can be copied bit by bit and
+// assigned: no destructor (the GC would run it on the empty ones of a chunk),
+// no postblit, no const parts. This asks for the size of the entry, so it must
+// only be evaluated in function bodies: a type that holds an AA of itself is not
+// complete yet when the layout of Impl is worked out.
+private template chunkedEntries(K, V)
+{
+    alias E = Entry!(K, V);
+    enum chunkedEntries = __traits(isPOD, E) &&
+        !(is(K == struct) && __traits(isNested, K)) &&
+        !(is(V == struct) && __traits(isNested, V)) &&
+        __traits(compiles, { E e = void; e.key = K.init; e.value = V.init; }) &&
+        E.sizeof <= 48;
 }
 
 // backward compatibility conversions
@@ -222,7 +245,11 @@ private:
 
     this(size_t sz /* = INIT_NUM_BUCKETS */) nothrow
     {
-        buckets = allocBuckets(sz);
+        // CTFE builds static AAs: no pointer into the block itself there
+        if (sz <= INLINE_BUCKETS && !__ctfe)
+            () @trusted { buckets = ibuckets[0 .. sz]; }();
+        else
+            buckets = allocBuckets(sz);
         firstUsed = cast(uint) buckets.length;
 
         // only for binary compatibility
@@ -258,6 +285,72 @@ private:
     immutable uint valoff;   // only for binary compatibility
     Flags flags;             // only for binary compatibility
     size_t delegate(scope ref const K) nothrow pure @nogc @safe hashFn;
+    Bucket[INLINE_BUCKETS] ibuckets; // the first buckets, see INLINE_BUCKETS
+
+    // Entries of plain data come from chunks of a few, handed out one after the
+    // other (see chunkedEntries): fewer objects for the collector and the entries
+    // of a table close to each other. A removed entry is not reused: its chunk is
+    // collected when all its entries are gone, as for any object. The size of a
+    // chunk is a few cache lines and not bigger: an entry that stays alive keeps
+    // the rest of its chunk alive too.
+    Entry!(K, V)* chunkNext;
+    uint chunkLeft;
+
+    Entry!(K, V)* takeFromChunk() @trusted pure nothrow
+    {
+        enum nChunk = (Entry!(K, V)).sizeof <= 16 ? 8 : 4;
+        if (chunkLeft == 0)
+        {
+            import core.memory : GC;
+            import core.exception : onOutOfMemoryError;
+            version (D_TypeInfo)
+                auto p = cast(Entry!(K, V)*) GC.calloc(nChunk * (Entry!(K, V)).sizeof, 0, typeid(Entry!(K, V)));
+            else
+                auto p = cast(Entry!(K, V)*) GC.calloc(nChunk * (Entry!(K, V)).sizeof, 0);
+            if (p is null)
+                onOutOfMemoryError();
+            chunkNext = p;
+            chunkLeft = nChunk;
+        }
+
+        auto e = chunkNext;
+        // never keep a pointer past the end of the chunk
+        chunkNext = --chunkLeft ? e + 1 : null;
+        return e;
+    }
+
+    // A new entry for key: from the current chunk when the entries are plain data.
+    Entry!(K, V)* newEntry(K2)(ref K2 key)
+    {
+        static if (chunkedEntries!(K, V) && __traits(compiles, { Entry!(K, V) t = void; t.key = key; }))
+        {
+            if (!__ctfe)
+            {
+                auto e = takeFromChunk();
+                e.key = key;
+                static if (!__traits(isZeroInit, V))
+                    () @trusted { (cast(ubyte*)&e.value)[0 .. V.sizeof] = 0; }();
+                return e;
+            }
+        }
+        return _newEntry!(K, V)(key);
+    }
+
+    /// ditto
+    Entry!(K, V)* newEntry(V2)(ref K key, auto ref V2 value)
+    {
+        static if (chunkedEntries!(K, V))
+        {
+            if (!__ctfe)
+            {
+                auto e = takeFromChunk();
+                e.key = key;
+                e.value = value;
+                return e;
+            }
+        }
+        return _newEntry!(K, V)(key, value);
+    }
 
     enum Flags : ubyte
     {
@@ -296,6 +389,30 @@ private:
         }
     }
 
+    // Lookup a key and, if it is not there, find where it goes, in the same walk:
+    // the first deleted slot on the way, or else the empty one that ends it.
+    inout(Bucket)* findSlotLookupInsert(K2)(size_t hash, scope ref const K2 key, out size_t ins) inout pure @safe nothrow
+    {
+        size_t del = size_t.max;
+        for (size_t i = hash & mask, j = 1;; ++j)
+        {
+            auto b = &buckets[i];
+            if (b.hash == hash && b.entry)
+            {
+                if (pure_keyEqual!(K2, K)(key, b.entry.key))
+                    return b;
+            }
+            else if (b.empty)
+            {
+                ins = del != size_t.max ? del : i;
+                return null;
+            }
+            else if (b.deleted && del == size_t.max)
+                del = i;
+            i = (i + j) & mask;
+        }
+    }
+
     // lookup a key
     inout(Bucket)* findSlotLookup(K2)(size_t hash, scope ref const K2 key) inout pure @safe nothrow
     {
@@ -330,7 +447,11 @@ private:
     void resize(size_t ndim) pure nothrow @safe
     {
         auto obuckets = buckets;
-        buckets = allocBuckets(ndim);
+        // a small table goes back inside the block when the buckets there are free
+        if (ndim <= INLINE_BUCKETS && !__ctfe && () @trusted { return obuckets.ptr !is ibuckets.ptr; }())
+            () @trusted { buckets = ibuckets[0 .. ndim]; }();
+        else
+            buckets = allocBuckets(ndim);
 
         foreach (ref b; obuckets[firstUsed .. $])
             if (b.filled)
@@ -339,6 +460,11 @@ private:
         firstUsed = 0;
         used -= deleted;
         deleted = 0;
+
+        // The old buckets of the block are abandoned: they must not keep the
+        // entries they point to alive.
+        if (!__ctfe && () @trusted { return obuckets.ptr is ibuckets.ptr; }())
+            ibuckets[] = Bucket.init;
         obuckets.length = 0; // safe to free b/c impossible to reference, but doesn't really free
     }
 
@@ -360,11 +486,24 @@ private:
         return mix(hash) | HASH_FILLED_MARK;
     }
 
-    static Bucket[] allocBuckets(size_t dim) pure nothrow @safe
+    static Bucket[] allocBuckets(size_t dim) pure nothrow @trusted
     {
-        // could allocate with BlkAttr.NO_INTERIOR, but that does not combine
-        //  well with arrays and type info for precise scanning
-        return new Bucket[dim];
+        // Straight from the collector: `new Bucket[dim]` makes an appendable
+        // array (metadata, a padding byte that pushes a power of two to the next
+        // size class) and walks the type info on the way. The buckets are never
+        // appended to. Could allocate with BlkAttr.NO_INTERIOR, but that does not
+        // combine well with arrays and type info for precise scanning.
+        import core.memory : GC;
+        import core.exception : onOutOfMemoryError;
+        if (__ctfe)
+            return new Bucket[dim];
+        version (D_TypeInfo)
+            auto p = cast(Bucket*) GC.calloc(dim * Bucket.sizeof, 0, typeid(Bucket));
+        else
+            auto p = cast(Bucket*) GC.calloc(dim * Bucket.sizeof, 0);
+        if (p is null)
+            onOutOfMemoryError();
+        return p[0 .. dim];
     }
 }
 
@@ -524,14 +663,14 @@ V* _aaGetX(K, V, K2, V2)(auto ref scope V[K] a, auto ref K2 key, out bool found,
     // get hash and bucket for key
     immutable hash = aa.calcHash(key2);
 
-    // found a value => return it
-    if (auto p = aa.findSlotLookup(hash, key2))
+    // found a value => return it; otherwise pi is the slot to insert in
+    size_t pi;
+    if (auto p = aa.findSlotLookupInsert(hash, key2, pi))
     {
         found = true;
         return &p.entry.value;
     }
 
-    auto pi = aa.findSlotInsert(hash);
     // check load factor and possibly grow
     if (!aa.buckets[pi].deleted && (aa.used + 1) * GROW_DEN > aa.dim * GROW_NUM)
     {
@@ -543,9 +682,9 @@ V* _aaGetX(K, V, K2, V2)(auto ref scope V[K] a, auto ref K2 key, out bool found,
     // allocate entry and update search cache (if not throwing in _newEntry)
     ref p = aa.buckets[pi];
     static if (is(V2 == _noV2))
-        p.entry = _newEntry!(K, V)(key2);
+        p.entry = aa.newEntry(key2);
     else
-        p.entry = _newEntry!(K, V)(key2, v2);
+        p.entry = aa.newEntry(key2, v2);
     if (p.deleted)
         --aa.deleted;
     else
@@ -614,7 +753,7 @@ auto _aaDup(T : V[K], K, V)(T a)
         auto pi = impl.findSlotInsert(hash);
         auto p = &impl.buckets[pi];
         p.hash = hash;
-        p.entry = new Entry!(K, V)(b.entry.key, b.entry.value);
+        p.entry = impl.newEntry(b.entry.key, b.entry.value);
         impl.firstUsed = min(impl.firstUsed, cast(uint)pi);
     }
     impl.used = cast(uint) len;
@@ -851,14 +990,14 @@ Impl!(K, V)* _d_assocarrayliteralTX(K, V)(K[] keys, V[] vals)
             static if (__traits(compiles, p.entry.value = vals[i])) // immutable?
                 p.entry.value = vals[i];
             else
-                p.entry = _newEntry!(K, V)(keys[i], vals[i]);
+                p.entry = aa.newEntry(keys[i], vals[i]);
             duplicates++;
             continue;
         }
         auto pi = aa.findSlotInsert(hash);
         p = &aa.buckets[pi];
         p.hash = hash;
-        p.entry = _newEntry!(K, V)(keys[i], vals[i]); // todo: move key and value?
+        p.entry = aa.newEntry(keys[i], vals[i]); // todo: move key and value?
         aa.firstUsed = min(aa.firstUsed, cast(uint)pi);
     }
     aa.used = cast(uint) (length - duplicates);
