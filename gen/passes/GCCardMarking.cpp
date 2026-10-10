@@ -6,6 +6,8 @@
 
 #include "gen/passes/GCCardMarking.h"
 
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -22,6 +24,16 @@ namespace {
 
 constexpr unsigned CardShift = 9;     // 512 byte cards
 constexpr unsigned SummaryShift = 16; // 64 KiB summary
+
+struct Cluster {
+  Value *Base = nullptr;
+  int64_t MinOffset = 0;
+  int64_t MaxOffset = 0;
+  Value *MinAddr = nullptr;
+  Value *MaxAddr = nullptr;
+  StoreInst *LastStore = nullptr;
+  SmallVector<StoreInst *, 4> Stores;
+};
 
 struct Marker {
   Module &M;
@@ -112,13 +124,7 @@ struct Marker {
 
   void markCard(IRBuilder<> &B, Value *Addr) {
     B.CreateCall(CompilerBarrier);
-    auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
-    auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
-    auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
-    Base->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
-    auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
-    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
-    markSummary(B, Int);
+    markCardNoBarrier(B, Addr);
   }
 
   /// One byte per 64 KiB, so that finding the dirty cards of a big heap does
@@ -161,6 +167,17 @@ struct Marker {
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
     markSummary(B, Int);
   }
+
+  void emitCluster(const Cluster &Clust) {
+    assert(Clust.LastStore && "Cluster has no stores");
+    IRBuilder<> B(Clust.LastStore->getNextNode());
+    B.SetCurrentDebugLocation(Clust.LastStore->getDebugLoc());
+    B.CreateCall(CompilerBarrier);
+    markCardNoBarrier(B, Clust.MinAddr);
+    if (Clust.MinOffset != Clust.MaxOffset) {
+      markCardNoBarrier(B, Clust.MaxAddr);
+    }
+  }
 };
 
 } // namespace
@@ -178,48 +195,138 @@ bool GCCardMarking::run(Module &M) {
       continue;
     }
 
-    SmallVector<Instruction *, 32> Work;
-    for (Instruction &I : instructions(F)) {
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
-        if (Marker::storesPointer(SI->getValueOperand()) &&
-            !Marker::isUntracked(SI->getPointerOperand())) {
-          Work.push_back(&I);
+    bool FnChanged = false;
+
+    for (BasicBlock &BB : F) {
+      SmallVector<Instruction *, 64> Insts;
+      for (Instruction &I : BB)
+        Insts.push_back(&I);
+
+      SmallVector<Cluster, 8> ActiveClusters;
+
+      auto flushClusters = [&]() {
+        if (ActiveClusters.empty())
+          return;
+        llvm::sort(ActiveClusters, [](const Cluster &A, const Cluster &B) {
+          return A.LastStore->comesBefore(B.LastStore);
+        });
+        for (const Cluster &C : ActiveClusters) {
+          K.emitCluster(C);
+          FnChanged = true;
         }
-      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
-        if (Marker::storesPointer(RMW->getValOperand()) &&
-            !Marker::isUntracked(RMW->getPointerOperand())) {
-          Work.push_back(&I);
+        ActiveClusters.clear();
+      };
+
+      auto addStore = [&](StoreInst *SI) {
+        int64_t Offset = 0;
+        Value *Base = GetPointerBaseWithConstantOffset(
+            SI->getPointerOperand(), Offset, M.getDataLayout());
+
+        for (auto &C : ActiveClusters) {
+          if (C.Base == Base) {
+            int64_t NewMin = std::min(C.MinOffset, Offset);
+            int64_t NewMax = std::max(C.MaxOffset, Offset);
+            if (NewMax - NewMin < (1 << CardShift)) {
+              if (Offset < C.MinOffset) {
+                C.MinOffset = Offset;
+                C.MinAddr = SI->getPointerOperand();
+              }
+              if (Offset > C.MaxOffset) {
+                C.MaxOffset = Offset;
+                C.MaxAddr = SI->getPointerOperand();
+              }
+              C.LastStore = SI;
+              C.Stores.push_back(SI);
+              return;
+            }
+            K.emitCluster(C);
+            FnChanged = true;
+            C.MinOffset = Offset;
+            C.MaxOffset = Offset;
+            C.MinAddr = SI->getPointerOperand();
+            C.MaxAddr = SI->getPointerOperand();
+            C.LastStore = SI;
+            C.Stores.clear();
+            C.Stores.push_back(SI);
+            return;
+          }
         }
-      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
-        if (Marker::storesPointer(CX->getNewValOperand()) &&
-            !Marker::isUntracked(CX->getPointerOperand())) {
-          Work.push_back(&I);
-        }
-      } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
-        if (!Marker::isUntracked(MT->getRawDest()) &&
-            !Marker::isPointerFreeCopy(MT)) {
-          Work.push_back(&I);
+
+        Cluster NewC;
+        NewC.Base = Base;
+        NewC.MinOffset = Offset;
+        NewC.MaxOffset = Offset;
+        NewC.MinAddr = SI->getPointerOperand();
+        NewC.MaxAddr = SI->getPointerOperand();
+        NewC.LastStore = SI;
+        NewC.Stores.push_back(SI);
+        ActiveClusters.push_back(NewC);
+      };
+
+      for (Instruction *I : Insts) {
+        if (I->isDebugOrPseudoInst())
+          continue;
+
+        if (auto *MT = dyn_cast<MemTransferInst>(I)) {
+          flushClusters();
+          if (!Marker::isUntracked(MT->getRawDest()) &&
+              !Marker::isPointerFreeCopy(MT)) {
+            IRBuilder<> B(MT->getNextNode());
+            B.SetCurrentDebugLocation(MT->getDebugLoc());
+            K.markRange(B, MT->getRawDest(), MT->getLength());
+            FnChanged = true;
+          }
+        } else if (auto *CB = dyn_cast<CallBase>(I)) {
+          if (auto *II = dyn_cast<IntrinsicInst>(CB)) {
+            if (II->isLifetimeStartOrEnd() ||
+                II->getIntrinsicID() == Intrinsic::assume)
+              continue;
+          }
+          flushClusters();
+        } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+          flushClusters();
+          if (Marker::storesPointer(RMW->getValOperand()) &&
+              !Marker::isUntracked(RMW->getPointerOperand())) {
+            IRBuilder<> B(RMW->getNextNode());
+            B.SetCurrentDebugLocation(RMW->getDebugLoc());
+            K.markCard(B, RMW->getPointerOperand());
+            FnChanged = true;
+          }
+        } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+          flushClusters();
+          if (Marker::storesPointer(CX->getNewValOperand()) &&
+              !Marker::isUntracked(CX->getPointerOperand())) {
+            IRBuilder<> B(CX->getNextNode());
+            B.SetCurrentDebugLocation(CX->getDebugLoc());
+            K.markCard(B, CX->getPointerOperand());
+            FnChanged = true;
+          }
+        } else if (isa<FenceInst>(I)) {
+          flushClusters();
+        } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+          if (SI->isVolatile() || SI->isAtomic()) {
+            flushClusters();
+            if (Marker::storesPointer(SI->getValueOperand()) &&
+                !Marker::isUntracked(SI->getPointerOperand())) {
+              IRBuilder<> B(SI->getNextNode());
+              B.SetCurrentDebugLocation(SI->getDebugLoc());
+              K.markCard(B, SI->getPointerOperand());
+              FnChanged = true;
+            }
+          } else if (Marker::storesPointer(SI->getValueOperand()) &&
+                     !Marker::isUntracked(SI->getPointerOperand())) {
+            addStore(SI);
+          }
+        } else if (I->isTerminator()) {
+          flushClusters();
         }
       }
+
+      flushClusters();
     }
 
-    if (!Work.empty()) {
-      // The barrier reads and writes memory the function did not declare.
+    if (FnChanged) {
       F.setMemoryEffects(MemoryEffects::unknown());
-    }
-
-    for (Instruction *I : Work) {
-      IRBuilder<> B(I->getNextNode());
-      B.SetCurrentDebugLocation(I->getDebugLoc());
-      if (auto *SI = dyn_cast<StoreInst>(I)) {
-        K.markCard(B, SI->getPointerOperand());
-      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
-        K.markCard(B, RMW->getPointerOperand());
-      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
-        K.markCard(B, CX->getPointerOperand());
-      } else if (auto *MT = dyn_cast<MemTransferInst>(I)) {
-        K.markRange(B, MT->getRawDest(), MT->getLength());
-      }
       Changed = true;
     }
   }
