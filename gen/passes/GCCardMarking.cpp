@@ -68,11 +68,54 @@ struct Marker {
     return T->isPtrOrPtrVectorTy();
   }
 
+  static bool typeContainsPointers(Type *T) {
+    if (T->isPtrOrPtrVectorTy()) {
+      return true;
+    }
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      for (Type *Elem : ST->elements()) {
+        if (typeContainsPointers(Elem))
+          return true;
+      }
+      return false;
+    }
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      return typeContainsPointers(AT->getElementType());
+    }
+    if (auto *VT = dyn_cast<VectorType>(T)) {
+      return typeContainsPointers(VT->getElementType());
+    }
+    return false;
+  }
+
+  static bool isPointerFreeObject(const Value *V) {
+    const Value *Obj = getUnderlyingObject(V);
+    if (auto *AI = dyn_cast<AllocaInst>(Obj)) {
+      return !typeContainsPointers(AI->getAllocatedType());
+    }
+    if (auto *GV = dyn_cast<GlobalVariable>(Obj)) {
+      return !typeContainsPointers(GV->getValueType());
+    }
+    return false;
+  }
+
+  static bool isPointerFreeCopy(const MemTransferInst *MT) {
+    if (MT->hasMetadata("d.pointer_free")) {
+      return true;
+    }
+    if (isPointerFreeObject(MT->getRawSource()) ||
+        isPointerFreeObject(MT->getRawDest())) {
+      return true;
+    }
+    return false;
+  }
+
   void markCard(IRBuilder<> &B, Value *Addr) {
     B.CreateCall(CompilerBarrier);
     auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
     auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
+    Base->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
     markSummary(B, Int);
@@ -83,6 +126,7 @@ struct Marker {
   void markSummary(IRBuilder<> &B, Value *AddrInt) {
     auto *SIdx = B.CreateLShr(AddrInt, ConstantInt::get(IntPtrTy, SummaryShift));
     auto *SBase = B.CreateLoad(PointerType::getUnqual(C), SummaryBase);
+    SBase->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
     auto *SSlot = B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx);
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), SSlot);
   }
@@ -112,6 +156,7 @@ struct Marker {
     auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
     auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
+    Base->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
     markSummary(B, Int);
@@ -151,7 +196,8 @@ bool GCCardMarking::run(Module &M) {
           Work.push_back(&I);
         }
       } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
-        if (!Marker::isUntracked(MT->getRawDest())) {
+        if (!Marker::isUntracked(MT->getRawDest()) &&
+            !Marker::isPointerFreeCopy(MT)) {
           Work.push_back(&I);
         }
       }

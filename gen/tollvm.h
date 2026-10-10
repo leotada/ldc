@@ -207,12 +207,27 @@ void DtoMemSetZero(LLType *type, LLValue *dst, unsigned align = 1);
  * @param src Source memory.
  * @param nbytes Number of bytes to copy.
  * @param align The minimum alignment of the source and destination memory.
+ * @param pointerFree Whether the copied data is known to contain no pointers.
  */
-void DtoMemCpy(LLValue *dst, LLValue *src, LLValue *nbytes, unsigned align = 1);
+llvm::CallInst *DtoMemCpy(LLValue *dst, LLValue *src, LLValue *nbytes, unsigned align = 1,
+                          bool pointerFree = false);
+
+/**
+ * The same as DtoMemCpy but figures out the size and pointerFree status based on
+ * the D type.
+ * @param type D type being copied.
+ * @param dst Destination memory.
+ * @param src Source memory.
+ * @param withPadding Use the type's padded size, not its store size.
+ * @param align The minimum alignment of the source and destination memory.
+ */
+llvm::CallInst *DtoMemCpy(Type *type, LLValue *dst, LLValue *src, bool withPadding = false,
+                          unsigned align = 1);
 
 /**
  * The same as DtoMemCpy but figures out the size itself based on the dst
  * pointee.
+ * @param type LLVM type.
  * @param dst Destination memory.
  * @param src Source memory.
  * @param withPadding Use the dst pointee's padded size, not its store size.

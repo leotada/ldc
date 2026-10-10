@@ -144,7 +144,7 @@ static LLValue *computeSize(LLValue *length, size_t elementSize) {
 
 static void copySlice(Loc loc, LLValue *dstarr, LLValue *dstlen,
                       LLValue *srcarr, LLValue *srclen, size_t elementSize,
-                      bool knownInBounds) {
+                      bool knownInBounds, bool isPointerFree = false) {
   const bool checksEnabled =
       global.params.useAssert == CHECKENABLEon || gIR->emitArrayBoundsChecks();
   if (checksEnabled && !knownInBounds) {
@@ -157,7 +157,7 @@ static void copySlice(Loc loc, LLValue *dstarr, LLValue *dstlen,
     // sz1 == 0 at runtime, this would probably still be legal (the C spec
     // is unclear here).
     LLValue *size = computeSize(dstlen, elementSize);
-    DtoMemCpy(dstarr, srcarr, size);
+    DtoMemCpy(dstarr, srcarr, size, 1, isPointerFree);
   }
 }
 
@@ -239,7 +239,7 @@ void DtoArrayAssign(Loc loc, DValue *lhs, DValue *rhs, EXP op,
           }
         }
         copySlice(loc, lhsPtr, lhsLength, rhsPtr, rhsLength, elementSize,
-                  knownInBounds);
+                  knownInBounds, !hasPointers(elemType));
       }
     } else if (isConstructing) {
       error(
@@ -581,9 +581,9 @@ void initializeArrayLiteral(IRState *p, ArrayLiteralExp *ale,
       auto gvar = new llvm::GlobalVariable(gIR->module, constarr->getType(),
                                            true, LLGlobalValue::InternalLinkage,
                                            constarr, ".arrayliteral");
-      gvar->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+      bool ptrFree = !hasPointers(ale->type->toBasetype()->nextOf());
       DtoMemCpy(dstMem, gvar,
-                DtoConstSize_t(getTypeAllocSize(constarr->getType())));
+                DtoConstSize_t(getTypeAllocSize(constarr->getType())), 1, ptrFree);
     }
   } else {
     // Store the elements one by one.

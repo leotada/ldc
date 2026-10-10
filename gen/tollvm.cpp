@@ -438,15 +438,28 @@ void DtoMemSetZero(LLType *type, LLValue *dst, unsigned align) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void DtoMemCpy(LLValue *dst, LLValue *src, LLValue *nbytes, unsigned align) {
+llvm::CallInst *DtoMemCpy(LLValue *dst, LLValue *src, LLValue *nbytes, unsigned align,
+                          bool pointerFree) {
   auto A = llvm::MaybeAlign(align);
-  gIR->ir->CreateMemCpy(dst, A, src, A, nbytes, false /*isVolatile*/);
+  auto *CI = gIR->ir->CreateMemCpy(dst, A, src, A, nbytes, false /*isVolatile*/);
+  if (pointerFree && CI) {
+    CI->setMetadata("d.pointer_free", llvm::MDNode::get(gIR->context(), {}));
+  }
+  return CI;
+}
+
+llvm::CallInst *DtoMemCpy(Type *type, LLValue *dst, LLValue *src, bool withPadding,
+                          unsigned align) {
+  uint64_t n =
+      withPadding ? getTypeAllocSize(DtoType(type)) : getTypeStoreSize(DtoType(type));
+  bool ptrFree = !hasPointers(type);
+  return DtoMemCpy(dst, src, DtoConstSize_t(n), align, ptrFree);
 }
 
 void DtoMemCpy(LLType *type, LLValue *dst, LLValue *src, bool withPadding, unsigned align) {
   uint64_t n =
       withPadding ? getTypeAllocSize(type) : getTypeStoreSize(type);
-  DtoMemCpy(dst, src, DtoConstSize_t(n), align);
+  DtoMemCpy(dst, src, DtoConstSize_t(n), align, false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
