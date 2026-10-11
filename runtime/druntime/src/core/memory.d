@@ -139,6 +139,11 @@ private
     extern (C) BlkInfo_ gc_query(return scope void* p) pure nothrow;
     extern (C) GC.Stats gc_stats ( ) @safe nothrow @nogc;
     extern (C) GC.ProfileStats gc_profileStats ( ) nothrow @nogc @safe;
+    extern (C) GC.FrameStats gc_frameStats ( ) nothrow @nogc @safe;
+    extern (C) void gc_excludeCurrentThread ( ) nothrow @nogc;
+    extern (C) void gc_includeCurrentThread ( ) nothrow @nogc;
+    extern (C) bool gc_isThreadExcluded ( ) nothrow @nogc;
+    extern (C) void gc_step ( ulong maxTimeHns ) nothrow @nogc;
 }
 
 version (CoreDdoc)
@@ -268,6 +273,38 @@ struct GC
         Duration maxPauseTime;
         /// largest time spent doing one GC cycle
         Duration maxCollectionTime;
+    }
+
+    /**
+     * Aggregation of real-time GC telemetry for game frame loops, profilers, and HUDs.
+     */
+    static struct FrameStats
+    {
+        import core.time : Duration;
+
+        /// Time spent by current thread in GC slow-path allocations
+        Duration threadAllocTime;
+        /// Time spent by current thread helping mark or sweep (mutator assist)
+        Duration threadCollectTime;
+        /// Time current thread was suspended by Stop-The-World pauses
+        Duration threadPauseTime;
+
+        /// Total time spent across all threads in allocator slow paths
+        Duration totalAllocTime;
+        /// Total time spent across all threads in collection/assists
+        Duration totalCollectTime;
+        /// Total time threads were suspended in STW pauses
+        Duration totalPauseTime;
+
+        /// Total number of GC cycles completed
+        size_t numCollections;
+        /// True if a background GC cycle (mark or sweep) is currently active
+        bool isCycleActive;
+
+        /// Currently allocated bytes on the GC heap
+        size_t usedSize;
+        /// Currently free bytes on the GC heap
+        size_t freeSize;
     }
 
 extern(C):
@@ -800,6 +837,63 @@ extern(D):
     static ProfileStats profileStats() nothrow @nogc @safe
     {
         return gc_profileStats();
+    }
+
+    /**
+     * Returns real-time frame telemetry for the current thread and collector.
+     * See `core.memory.GC.FrameStats` for list of available metrics.
+     */
+    static FrameStats frameStats() nothrow @nogc @safe
+    {
+        return gc_frameStats();
+    }
+
+    /**
+     * Excludes the calling thread from Stop-The-World pauses and GC stack scans.
+     * Ideal for real-time audio (OpenAL, JACK, ALSA) or low-latency threads that
+     * must never be interrupted by garbage collection.
+     * An excluded thread must not allocate on the GC heap.
+     */
+    static void excludeCurrentThread() nothrow @nogc
+    {
+        gc_excludeCurrentThread();
+    }
+
+    /**
+     * Re-includes the calling thread in Stop-The-World pauses and GC stack scans.
+     */
+    static void includeCurrentThread() nothrow @nogc
+    {
+        gc_includeCurrentThread();
+    }
+
+    /**
+     * Returns true if the calling thread is currently excluded from GC Stop-The-World pauses.
+     */
+    static bool isThreadExcluded() nothrow @nogc
+    {
+        return gc_isThreadExcluded();
+    }
+
+    /**
+     * Donates idle mutator time (e.g. before V-Sync) to advance background GC work
+     * (concurrent sweeping or marking). Performs a single incremental step.
+     */
+    static void step() nothrow @nogc
+    {
+        gc_step(0);
+    }
+
+    /**
+     * Donates idle mutator time (e.g. before V-Sync) to advance background GC work
+     * up to the specified maximum duration.
+     * Params:
+     *   maxTime = maximum time duration (e.g. Duration or hnsecs) to spend in GC work.
+     */
+    static void step(T)(T maxTime) nothrow @nogc
+        if (__traits(hasMember, T, "total"))
+    {
+        gc_step(maxTime.total!"hnsecs");
     }
 
 extern(C):

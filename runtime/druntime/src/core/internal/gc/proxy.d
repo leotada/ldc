@@ -211,6 +211,51 @@ extern (C)
         return instance.profileStats();
     }
 
+    core.memory.GC.FrameStats gc_frameStats() @safe nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            return telem.frameStats();
+
+        core.memory.GC.FrameStats fs;
+        auto st = instance.stats();
+        auto ps = instance.profileStats();
+        fs.usedSize = st.usedSize;
+        fs.freeSize = st.freeSize;
+        fs.numCollections = ps.numCollections;
+        fs.totalPauseTime = ps.totalPauseTime;
+        return fs;
+    }
+
+    void gc_excludeCurrentThread() nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            telem.excludeCurrentThread();
+    }
+
+    void gc_includeCurrentThread() nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            telem.includeCurrentThread();
+    }
+
+    bool gc_isThreadExcluded() nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            return telem.isThreadExcluded();
+        return false;
+    }
+
+    void gc_step(ulong maxTimeHns) nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            telem.step(maxTimeHns);
+    }
+
     void gc_addRoot( void* p ) nothrow @nogc
     {
         return instance.addRoot( p );

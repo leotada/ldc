@@ -299,3 +299,17 @@ interface GC
      */
     void cleanupThread(ThreadBase thread) nothrow @nogc;
 }
+
+/**
+ * Optional interface for GC implementations that support real-time frame telemetry,
+ * thread exclusion (e.g. for audio/game loops), and incremental pacing.
+ * Discovered dynamically via `cast(GCTelemetry) gcInstance` (ADR-8).
+ */
+interface GCTelemetry
+{
+    core.memory.GC.FrameStats frameStats() nothrow @nogc @safe;
+    void excludeCurrentThread() nothrow @nogc;
+    void includeCurrentThread() nothrow @nogc;
+    bool isThreadExcluded() nothrow @nogc;
+    void step(ulong maxTimeHns) nothrow @nogc;
+}
