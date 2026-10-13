@@ -1030,6 +1030,10 @@ void registerPredefinedVersions() {
     VersionCondition::addPredefinedGlobalIdent("D_Coverage");
   }
 
+  if (global.params.gcBarrier) {
+    VersionCondition::addPredefinedGlobalIdent("D_GCBarrier");
+  }
+
   if (global.params.useUnitTests) {
     VersionCondition::addPredefinedGlobalIdent("unittest");
   }

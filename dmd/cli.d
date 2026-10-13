@@ -1086,6 +1086,9 @@ dmd -cov -unittest myprog.d
             "https://dlang.org/spec/attribute.html#system-variables"),
         Feature("fastdfa", "useFastDFA",
             "Fast dataflow analysis engine, experimental"),
+        Feature("gcbarrier", "gcBarrier",
+            "call the GC write barrier after each store of a pointer to memory that is not a local, for concurrent collectors, experimental",
+            "https://dlang.org/spec/garbage.html"),
     ];
 }
 

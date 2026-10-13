@@ -19,6 +19,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
@@ -205,20 +206,32 @@ struct Marker {
     return L;
   }
 
+  /// The byte that marks a card (or a summary). The collector must not find it
+  /// set before the pointer that was stored is visible, or it could scan the
+  /// memory, clear the card, and miss the pointer: on a CPU that reorders
+  /// stores (ARM) that takes a release store. On x86 a release store is a plain
+  /// `mov`, so there the ordinary store is kept and LLVM stays free to treat it
+  /// as one (the compiler barrier above already orders it against the compiler).
+  void markByte(IRBuilder<> &B, Value *Ptr) {
+    auto *SI = B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Ptr);
+    if (!Triple(M.getTargetTriple()).isX86()) {
+      SI->setAlignment(Align(1));
+      SI->setAtomic(AtomicOrdering::Release);
+    }
+  }
+
   void storeCard(IRBuilder<> &B, Value *Addr, Value *Lo) {
     auto *Rel = B.CreateSub(B.CreatePtrToInt(Addr, IntPtrTy), Lo);
     auto *Idx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, CardShift));
     auto *Base = invariantLoad(B, PointerType::getUnqual(C), CardBase);
-    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
-                  B.CreateGEP(Type::getInt8Ty(C), Base, Idx));
+    markByte(B, B.CreateGEP(Type::getInt8Ty(C), Base, Idx));
 
     // One byte per 64 KiB, so that finding the dirty cards of a big heap does
     // not mean reading all of the card table.
     if (EmitCardSummary && SummaryBase) {
       auto *SIdx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, SummaryShift));
       auto *SBase = invariantLoad(B, PointerType::getUnqual(C), SummaryBase);
-      B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
-                    B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx));
+      markByte(B, B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx));
     }
   }
 

@@ -585,7 +585,8 @@ void runOptimizationPasses(llvm::Module *M, llvm::TargetMachine *TM) {
     mpm = pb.buildPerModuleDefaultPipeline(level);
   }
 
-  if (gcCardMarking) {
+  // -preview=gcbarrier is the switch shared with DMD; -gc-card-marking stays as the hidden spelling.
+  if (gcCardMarking || global.params.gcBarrier) {
     mpm.addPass(GCCardMarkingPass());
   }
 
@@ -662,7 +663,7 @@ void outputOptimizationSettings(llvm::raw_ostream &hash_os) {
   hash_os << disableSimplifyDruntimeCalls;
   hash_os << disableSimplifyLibCalls;
   hash_os << disableGCToStack;
-  hash_os << gcCardMarking;
+  hash_os << (gcCardMarking || global.params.gcBarrier);
   hash_os << stripDebug;
   hash_os << disableLoopUnrolling;
   hash_os << disableLoopVectorization;
